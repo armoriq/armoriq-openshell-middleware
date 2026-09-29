@@ -7,6 +7,12 @@ Nothing in OpenShell is modified. No fork, nothing installed inside the sandbox,
 and nothing added to the agent. This registers through OpenShell's own middleware
 contract and is called before a sandbox's request leaves.
 
+**Any agent, any tool.** The agent is not modified and never learns this exists, so
+its framework, language and runtime are irrelevant. Enforcement happens at the
+connection OpenShell already owns, and the tool name is read off the wire, so any
+tool your MCP servers expose works whatever it is called. The examples below use
+placeholder tool names; substitute your own.
+
 ## What it does
 
 OpenShell calls this service at `PRE_CREDENTIALS`, before credentials are injected,

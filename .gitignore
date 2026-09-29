@@ -1,0 +1,4 @@
+/openshell-middleware
+*.test
+/dist/
+.DS_Store

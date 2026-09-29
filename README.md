@@ -18,6 +18,10 @@ Two checks run per request:
 1. **Is this tool one the sandbox was set up to use?** The tool set is declared in
    the sandbox policy and checked in process, typically under ten microseconds. A
    tool outside that set is refused without consulting any policy.
+
+   The tool name is read from the request body. For MCP that is
+   `params.name` on a `tools/call`, so **any tool your MCP servers expose works**,
+   whatever they are named. Nothing is hardcoded to a particular provider.
 2. **Does policy permit this agent to call it?** Evaluated by the ArmorIQ control
    plane, scoped to the agent the sandbox declares.
 
@@ -43,7 +47,8 @@ and the policies that govern your agents live together.
 
 A new organization has no policies and the default is to block, so add one before
 your first run or every call is denied. A minimal policy that exercises both
-decision paths:
+decision paths, using two tool names as an example. **Substitute tools your own
+agents actually call:**
 
 ```yaml
 name: OpenShell trial
@@ -51,11 +56,14 @@ scope:
   target_type: org
 default_action: block
 rules:
-  - tool: github_list_issues
+  - tool: your_read_tool     # allowed, and declared by the sandbox below
     action: allow
-  - tool: github_create_issue
+  - tool: your_write_tool    # declared by the sandbox, but policy refuses it
     action: block
 ```
+
+Then a third tool that the sandbox never declares at all shows the in-process
+refusal, without a policy being consulted.
 
 ### 3. Run it
 
@@ -115,7 +123,7 @@ network_middlewares:
     on_error: fail_closed
     config:
       agent_id: "<the agent this sandbox runs>"
-      declared_tools: ["github_list_issues", "github_create_issue"]
+      declared_tools: ["your_read_tool", "your_write_tool"]
     endpoints:
       include: ["mcp.example.internal"]
 ```

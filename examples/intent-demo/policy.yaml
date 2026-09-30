@@ -30,7 +30,7 @@ network_middlewares:
     on_error: fail_closed
     config:
       agent_id: "openshell-demo"
-      declared_tools: ["github_list_issues", "github_create_issue"]
+      declared_tools: ["github_list_issues", "github_create_issue", "github_list_pull_requests"]
       model_hosts: ["host.openshell.internal"]
     endpoints:
       include: ["host.openshell.internal", "postman-echo.com"]

@@ -2,7 +2,9 @@ package openshell
 
 import (
 	"encoding/json"
+	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,6 +23,30 @@ const CodeDrift = "intent_drift_from_plan"
 // been seen for the sandbox. Without it, a sandbox is held to its captured plan
 // only once one exists, which is the safer default for rolling this out.
 const ConfigRequireCapturedPlan = "require_captured_plan"
+
+// ConfigModelHosts names the hosts that are the sandbox's model. A request to
+// one is the agent asking what to do, not a tool call, so it is passed to
+// OpenShell's network policy. A plan is read only from a reply one of them sent:
+// a tool server could otherwise return a completion-shaped body and choose the
+// plan it is then held to.
+const ConfigModelHosts = "model_hosts"
+
+// ModelHostsFromConfig reads ConfigModelHosts, lowercased.
+func ModelHostsFromConfig(cfg *structpb.Struct) []string {
+	list := cfg.GetFields()[ConfigModelHosts].GetListValue()
+	out := make([]string, 0, len(list.GetValues()))
+	for _, v := range list.GetValues() {
+		if h := strings.ToLower(strings.TrimSpace(v.GetStringValue())); h != "" {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+// IsModelHost reports whether host is one of the sandbox's model hosts.
+func IsModelHost(hosts []string, host string) bool {
+	return slices.Contains(hosts, strings.ToLower(host))
+}
 
 // capturedPlanTTL bounds how long a plan is honoured. An agent that goes quiet
 // and comes back should be working from a fresh reply, not the last one.

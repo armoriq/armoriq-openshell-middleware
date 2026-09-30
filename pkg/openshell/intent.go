@@ -155,6 +155,14 @@ func (v *IntentVerifier) Verify(ctx context.Context, req *HttpRequestEvaluation)
 // decide returns the verdict, the identity it used, and whether it asked the
 // control plane. The last one decides who records the decision.
 func (v *IntentVerifier) decide(ctx context.Context, req *HttpRequestEvaluation, act Action, sandbox string) (Verdict, Identity, bool, error) {
+	// Asking the model what to do is not a tool call. It is governed by
+	// OpenShell's network policy like any other traffic, and its reply is where
+	// the plan is read.
+	if IsModelHost(ModelHostsFromConfig(req.GetConfig()), act.Host) {
+		return Verdict{Allow: true,
+			Reason: fmt.Sprintf("model call to %s%s, passed to network policy", act.Host, act.Path)}, Identity{}, false, nil
+	}
+
 	if !act.Named() {
 		if v.unnamed == AllowUnnamed {
 			return Verdict{Allow: true,

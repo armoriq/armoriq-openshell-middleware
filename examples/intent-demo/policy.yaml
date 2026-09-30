@@ -1,0 +1,36 @@
+version: 1
+
+network_policies:
+  model:
+    name: model
+    endpoints:
+      - host: host.openshell.internal
+        port: 18090
+        protocol: rest
+        rules:
+          - allow: { method: POST, path: /v1/chat/completions }
+    binaries:
+      - path: /usr/bin/curl
+  tools:
+    name: tools
+    endpoints:
+      - host: postman-echo.com
+        port: 443
+        protocol: rest
+        rules:
+          - allow: { method: POST, path: /post }
+    binaries:
+      - path: /usr/bin/curl
+
+network_middlewares:
+  armoriq:
+    name: ArmorIQ intent enforcement
+    middleware: armoriq-intent
+    order: 10
+    on_error: fail_closed
+    config:
+      agent_id: "openshell-demo"
+      declared_tools: ["github_list_issues", "github_create_issue"]
+      model_hosts: ["host.openshell.internal"]
+    endpoints:
+      include: ["host.openshell.internal", "postman-echo.com"]

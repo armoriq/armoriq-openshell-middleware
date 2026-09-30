@@ -45,7 +45,8 @@ out to do for the task in hand, because that first appears in the model's reply,
 arrives on a response.
 
 With `-capture-plan`, the service also registers on the response path. It reads each
-model reply on its way back to the sandbox and records the tool calls it asks for.
+reply from the sandbox's model on its way back to the sandbox and records the tool calls
+it asks for.
 Every later request is checked against that plan as well, after the declared scope and
 before policy:
 
@@ -63,6 +64,12 @@ sandbox receives it, so the plan is in place before the agent can act on it.
 **This needs OpenShell v0.1.0 or later**, the first release that dispatches
 `HTTP_RESPONSE/PRE_RETURN`. Earlier gateways reject that binding at registration and then
 refuse to start, so leave `-capture-plan` off on them.
+
+List the model's hosts in `model_hosts`. A request to one of them is the agent asking
+what to do, not a tool call, so it passes to OpenShell's network policy instead of being
+refused as naming no tool. Plans are read only from replies those hosts send: a tool
+server that returns a completion-shaped body cannot choose the plan. Include the model
+host in the middleware's `endpoints.include` too, or its replies never reach the service.
 
 Set `require_captured_plan: true` in a sandbox's middleware config to refuse tool calls
 made before any model reply has been seen. Without it, a sandbox is held to its plan
@@ -163,7 +170,8 @@ network_middlewares:
     config:
       agent_id: "<the agent this sandbox runs>"
       declared_tools: ["your_read_tool", "your_write_tool"]
-      # require_captured_plan: true   # only with -capture-plan, see above
+      # model_hosts: ["api.openai.com"]  # with -capture-plan, see above
+      # require_captured_plan: true      # only with -capture-plan
     endpoints:
       include: ["mcp.example.internal"]
 ```
@@ -267,9 +275,14 @@ decide requests some other way while keeping the OpenShell plumbing.
 
 ## Verified against
 
-OpenShell gateway config version 1, with the middleware registered over plaintext
-loopback on the same host, sandboxes created through `sandbox create --policy`, and
-MCP `tools/call` traffic over HTTP.
+OpenShell v0.1.2 as released, gateway and published supervisor image, Docker driver,
+with the middleware registered over plaintext on the same host. The run in
+[examples/intent-demo](examples/intent-demo) passes end to end: the model call passes,
+its plan is captured from the reply, the call it asked for is decided by policy, and the
+one it did not ask for is refused with `intent_drift_from_plan` without reaching policy.
+
+Request-side enforcement was earlier verified on OpenShell 0.0.116 with gateway config
+version 1.
 
 ## License
 

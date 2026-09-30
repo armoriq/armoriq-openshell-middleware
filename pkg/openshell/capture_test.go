@@ -197,10 +197,20 @@ func responseStream(t *testing.T, c *PlanCapture) grpc.BidiStreamingClient[HttpR
 	return stream
 }
 
+func modelHostConfig() *structpb.Struct {
+	c, _ := structpb.NewStruct(map[string]any{ConfigModelHosts: []any{"model.internal"}})
+	return c
+}
+
 func preflight(status uint32, contentType string, modes ...HttpResponseBodyMode) *HttpResponseEvent {
+	return preflightFrom("model.internal", status, contentType, modes...)
+}
+
+func preflightFrom(host string, status uint32, contentType string, modes ...HttpResponseBodyMode) *HttpResponseEvent {
 	return &HttpResponseEvent{Event: &HttpResponseEvent_Preflight{Preflight: &HttpResponsePreflight{
 		Context:            &RequestContext{SandboxId: "sbx-1"},
-		Target:             &HttpRequestTarget{Host: "model.internal", Path: "/v1/chat/completions"},
+		Config:             modelHostConfig(),
+		Target:             &HttpRequestTarget{Host: host, Path: "/v1/chat/completions"},
 		StatusCode:         status,
 		Headers:            []*HttpHeader{{Name: "Content-Type", Value: contentType}},
 		PermittedBodyModes: modes,
@@ -288,5 +298,59 @@ func TestRequiringAPlanWithoutCapturingFailsClosed(t *testing.T) {
 	}
 	if seen.Tool != "" {
 		t.Errorf("asked the control plane about %q", seen.Tool)
+	}
+}
+
+func TestAReplyFromAToolHostIsNeverThePlan(t *testing.T) {
+	// A tool server that returns a completion-shaped body must not get to choose
+	// the plan the sandbox is then held to.
+	c := NewPlanCapture()
+	s := responseStream(t, c)
+	if err := s.Send(preflightFrom("postman-echo.com", 200, "application/json",
+		HttpResponseBodyMode_HTTP_RESPONSE_BODY_MODE_WHOLE_BODY_BYTES)); err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.Recv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.GetPreflightResult().GetSkip() == nil {
+		t.Fatalf("preflight from a tool host = %v, want skip", res.GetPreflightResult())
+	}
+	if _, ok := c.Lookup("sbx-1"); ok {
+		t.Fatal("a plan was recorded from a host that is not the model")
+	}
+}
+
+func TestAskingTheModelIsNotAToolCall(t *testing.T) {
+	v, seen := verifierAgainst(t, 200, map[string]any{"allowed": true, "enforcementAction": "allow"})
+	v.WithCapture(NewPlanCapture())
+	req := &HttpRequestEvaluation{
+		Context: &RequestContext{SandboxId: "sbx-1"},
+		Config:  modelHostConfig(),
+		Target:  &HttpRequestTarget{Scheme: "https", Host: "model.internal", Method: "POST", Path: "/v1/chat/completions"},
+		Headers: []*HttpHeader{{Name: "content-type", Value: "application/json"}},
+		Body:    []byte(`{"model":"m","messages":[{"role":"user","content":"list the issues"}]}`),
+	}
+	got, err := v.Verify(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Allow {
+		t.Fatalf("the agent's call to its own model was refused: %+v", got)
+	}
+	if seen.Tool != "" {
+		t.Errorf("a model call went to the control plane as tool %q", seen.Tool)
+	}
+}
+
+func TestConfigAcceptsModelHosts(t *testing.T) {
+	ok, _ := structpb.NewStruct(map[string]any{ConfigModelHosts: []any{"api.openai.com"}})
+	if err := ValidateIntentConfig(ok); err != nil {
+		t.Errorf("rejected a host list: %v", err)
+	}
+	bad, _ := structpb.NewStruct(map[string]any{ConfigModelHosts: "api.openai.com"})
+	if err := ValidateIntentConfig(bad); err == nil {
+		t.Error("accepted a string where a list is required")
 	}
 }

@@ -61,6 +61,16 @@ func ValidateIntentConfig(cfg *structpb.Struct) error {
 			if _, ok := v.GetKind().(*structpb.Value_StringValue); !ok {
 				return fmt.Errorf("%s must be a string", k)
 			}
+		case ConfigModelHosts:
+			list := v.GetListValue()
+			if list == nil {
+				return fmt.Errorf("%s must be a list of host names", ConfigModelHosts)
+			}
+			for _, item := range list.GetValues() {
+				if _, ok := item.GetKind().(*structpb.Value_StringValue); !ok {
+					return fmt.Errorf("%s must contain only host names", ConfigModelHosts)
+				}
+			}
 		case ConfigRequireCapturedPlan:
 			if _, ok := v.GetKind().(*structpb.Value_BoolValue); !ok {
 				return fmt.Errorf("%s must be true or false", k)
@@ -81,8 +91,8 @@ func ValidateIntentConfig(cfg *structpb.Struct) error {
 	}
 	if len(unknown) > 0 {
 		sort.Strings(unknown)
-		return fmt.Errorf("unknown config key %v, accepted keys are %s, %s, %s and %s",
-			unknown, ConfigAgentID, ConfigUserEmail, ConfigDeclaredTools, ConfigRequireCapturedPlan)
+		return fmt.Errorf("unknown config key %v, accepted keys are %s, %s, %s, %s and %s",
+			unknown, ConfigAgentID, ConfigUserEmail, ConfigDeclaredTools, ConfigModelHosts, ConfigRequireCapturedPlan)
 	}
 	return nil
 }

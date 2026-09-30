@@ -11,8 +11,9 @@ import (
 
 // ResponseService implements HttpResponsePreReturnServer.
 //
-// It reads model replies on their way back to the sandbox and records the tool
-// calls they ask for. It never changes or blocks a response. Reading the plan
+// It reads replies from the sandbox's model hosts on their way back to the
+// sandbox and records the tool calls they ask for. Every other response is
+// skipped at the head. It never changes or blocks a response. Reading the plan
 // is the whole job here: enforcing it happens on the request that follows,
 // where the request hook already sits and already has the tool name.
 //
@@ -33,7 +34,8 @@ func NewResponseService(capture *PlanCapture) *ResponseService {
 // Evaluate runs one stage for one response: preflight, then at most one whole
 // body, then trailers. Each of those gets exactly one result, in order.
 func (r *ResponseService) Evaluate(stream grpc.BidiStreamingServer[HttpResponseEvent, HttpResponseEventResult]) error {
-	var sandbox, target string
+	var sandbox, host, target string
+	var modelHosts []string
 	for {
 		ev, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
@@ -47,8 +49,14 @@ func (r *ResponseService) Evaluate(stream grpc.BidiStreamingServer[HttpResponseE
 		case *HttpResponseEvent_Preflight:
 			p := e.Preflight
 			sandbox = p.GetContext().GetSandboxId()
-			target = p.GetTarget().GetHost() + p.GetTarget().GetPath()
-			if err := stream.Send(preflightResult(p)); err != nil {
+			host = p.GetTarget().GetHost()
+			target = host + p.GetTarget().GetPath()
+			modelHosts = ModelHostsFromConfig(p.GetConfig())
+			result := preflightResult(p)
+			if !IsModelHost(modelHosts, host) {
+				result = skipResult()
+			}
+			if err := stream.Send(result); err != nil {
 				return err
 			}
 
@@ -87,12 +95,17 @@ func (r *ResponseService) Evaluate(stream grpc.BidiStreamingServer[HttpResponseE
 // anything streamed are delivered without being buffered. OpenShell already
 // leaves WHOLE_BODY_BYTES out of the permitted modes for encoded, partial and
 // oversized bodies, so its absence covers those too.
-func preflightResult(p *HttpResponsePreflight) *HttpResponseEventResult {
-	skip := &HttpResponseEventResult{Result: &HttpResponseEventResult_PreflightResult{
+func skipResult() *HttpResponseEventResult {
+	return &HttpResponseEventResult{Result: &HttpResponseEventResult_PreflightResult{
 		PreflightResult: &HttpResponsePreflightResult{
 			Action: &HttpResponsePreflightResult_Skip{Skip: &HttpResponsePreflightSkip{}},
 		},
 	}}
+}
+
+// preflightResult is only asked for replies from a model host.
+func preflightResult(p *HttpResponsePreflight) *HttpResponseEventResult {
+	skip := skipResult()
 
 	if p.GetStatusCode() < 200 || p.GetStatusCode() > 299 {
 		return skip

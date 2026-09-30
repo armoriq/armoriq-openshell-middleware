@@ -9,7 +9,6 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
-	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
@@ -150,11 +149,11 @@ func TestConfigAcceptsRequireCapturedPlan(t *testing.T) {
 }
 
 func TestResponseBindingIsOptIn(t *testing.T) {
-	m, _ := New("x", "v", allowVerifier{}).Describe(context.Background(), &emptypb.Empty{})
+	m, _ := New("x", "v", allowVerifier{}).Describe(context.Background(), &MiddlewareDescribeRequest{})
 	if len(m.GetBindings()) != 1 {
 		t.Fatalf("default manifest has %d bindings; stock OpenShell refuses to start on the response one", len(m.GetBindings()))
 	}
-	m, _ = New("x", "v", allowVerifier{}, WithResponseBinding()).Describe(context.Background(), &emptypb.Empty{})
+	m, _ = New("x", "v", allowVerifier{}, WithResponseBinding()).Describe(context.Background(), &MiddlewareDescribeRequest{})
 	if len(m.GetBindings()) != 2 {
 		t.Fatalf("got %d bindings with the response binding enabled", len(m.GetBindings()))
 	}

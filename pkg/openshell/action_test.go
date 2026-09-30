@@ -122,10 +122,10 @@ func TestTheRequestOpenshellActuallySends(t *testing.T) {
 	req := &HttpRequestEvaluation{
 		Phase: SupervisorMiddlewarePhase_SUPERVISOR_MIDDLEWARE_PHASE_PRE_CREDENTIALS,
 		Context: &RequestContext{
-			RequestId:   "59ba2d34-20ef-47b4-9d0d-5b8b745392e9",
-			SandboxId:   "c46157b3-a7fa-454f-94a4-1f312baea298",
-			SandboxName: "mwtest3",
-			Workspace:   "default",
+			RequestId: "59ba2d34-20ef-47b4-9d0d-5b8b745392e9",
+			SandboxId: "c46157b3-a7fa-454f-94a4-1f312baea298",
+			Sandbox:   "mwtest3",
+			Workspace: "default",
 		},
 		Target: &HttpRequestTarget{Scheme: "https", Host: "api.github.com", Port: 443, Method: "POST", Path: "/mcp"},
 		Headers: []*HttpHeader{

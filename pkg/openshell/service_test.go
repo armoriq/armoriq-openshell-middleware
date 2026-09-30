@@ -5,8 +5,6 @@ import (
 	"errors"
 	"strings"
 	"testing"
-
-	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 type stubVerifier struct {
@@ -27,7 +25,7 @@ func eval(sandbox string) *HttpRequestEvaluation {
 
 func TestDescribeDeclaresHttpRequestAtPreCredentials(t *testing.T) {
 	s := New("armoriq-intent", "0.1.0", stubVerifier{v: Verdict{Allow: true}})
-	m, err := s.Describe(context.Background(), &emptypb.Empty{})
+	m, err := s.Describe(context.Background(), &MiddlewareDescribeRequest{})
 	if err != nil {
 		t.Fatalf("Describe: %v", err)
 	}

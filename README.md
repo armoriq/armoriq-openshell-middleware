@@ -2,9 +2,9 @@
 
 Tool-level enforcement for agents running in
 [OpenShell](https://github.com/NVIDIA/openshell) sandboxes, as a supervisor middleware.
-On a gateway that dispatches responses to middleware, it also holds each sandbox to the
-plan its model issued, which is what intent enforcement needs. Stock OpenShell does not
-dispatch responses yet; see [Holding a sandbox to its model's plan](#holding-a-sandbox-to-its-models-plan).
+On OpenShell v0.1.0 and later, which pass HTTP responses to middleware, it also holds
+each sandbox to the plan its model issued, which is what intent enforcement needs. See
+[Holding a sandbox to its model's plan](#holding-a-sandbox-to-its-models-plan).
 
 Nothing in OpenShell is modified. No fork, nothing installed inside the sandbox,
 and nothing added to the agent. This registers through OpenShell's own middleware
@@ -41,8 +41,8 @@ the one being asked.
 ## Holding a sandbox to its model's plan
 
 Both checks above are about what the sandbox may do. Neither sees what the agent set
-out to do for the task in hand, because that first appears in the model's reply, and
-stock OpenShell calls no middleware on responses.
+out to do for the task in hand, because that first appears in the model's reply, which
+arrives on a response.
 
 With `-capture-plan`, the service also registers on the response path. It reads each
 model reply on its way back to the sandbox and records the tool calls it asks for.
@@ -60,10 +60,9 @@ consulting policy. A reply that asks for no tools is recorded as an empty plan, 
 call made after the model has finished is refused too. The reply is read before the
 sandbox receives it, so the plan is in place before the agent can act on it.
 
-**This needs a gateway that dispatches `HTTP_RESPONSE/PRE_RETURN`.** Stock OpenShell
-rejects that binding at registration and then refuses to start, so leave
-`-capture-plan` off unless the gateway runs the patch in
-[patches/openshell](patches/openshell).
+**This needs OpenShell v0.1.0 or later**, the first release that dispatches
+`HTTP_RESPONSE/PRE_RETURN`. Earlier gateways reject that binding at registration and then
+refuse to start, so leave `-capture-plan` off on them.
 
 Set `require_captured_plan: true` in a sandbox's middleware config to refuse tool calls
 made before any model reply has been seen. Without it, a sandbox is held to its plan
@@ -187,7 +186,7 @@ service.
 | `-timeout` | `450ms` | binding timeout to declare, between 10ms and 30s |
 | `-max-body` | `262144` | largest body accepted buffered |
 | `-audit` | `true` | record decisions the control plane does not see |
-| `-capture-plan` | `false` | read model replies and hold each sandbox to the plan they issue. Needs a gateway that dispatches responses |
+| `-capture-plan` | `false` | read model replies and hold each sandbox to the plan they issue. Needs OpenShell v0.1.0 or later |
 | `-name` | `armoriq-intent` | manifest name, diagnostic only |
 | `-deny` | `false` | deny everything, to prove the path end to end |
 | `-dump-request` | `false` | log the whole evaluation proto |
@@ -237,7 +236,7 @@ decision path and a full buffer drops rows rather than delaying a decision.
 - **The declared tool set is written by whoever creates the sandbox**, not declared
   by the agent. It is a scope boundary for the sandbox rather than a per task
   declaration.
-- **Responses only with `-capture-plan` on a patched gateway.** Without both, nothing
+- **Responses only with `-capture-plan` on v0.1.0 or later.** Without both, nothing
   returning to the sandbox is inspected. With them, model replies are read, never
   changed or blocked.
 - **The plan is what the model asked for, not what the user asked for.** It catches an
@@ -260,8 +259,7 @@ decision path and a full buffer drops rows rather than delaying a decision.
 cmd/openshell-middleware   the binary
 pkg/openshell              the gRPC services and the decision logic
 pkg/iapclient              the ArmorIQ control plane client
-proto/openshell            OpenShell's middleware contract, vendored
-patches/openshell          the gateway patch that dispatches responses
+proto/openshell            OpenShell's middleware contract, vendored from the release in UPSTREAM_VERSION
 ```
 
 The `Verifier` interface in `pkg/openshell` is the extension point if you want to

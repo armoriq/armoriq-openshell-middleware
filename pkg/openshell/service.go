@@ -20,8 +20,9 @@ import (
 	"regexp"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/durationpb"
-	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
@@ -139,7 +140,10 @@ func WithResponseBinding() Option { return func(s *Service) { s.responseBinding 
 // before OpenShell injects credentials. The response binding at PRE_RETURN is
 // where the agent's intent first appears, in the model's reply, and is declared
 // only when enabled.
-func (s *Service) Describe(context.Context, *emptypb.Empty) (*MiddlewareManifest, error) {
+func (s *Service) Describe(_ context.Context, req *MiddlewareDescribeRequest) (*MiddlewareManifest, error) {
+	if err := checkGateway(req.GetGateway()); err != nil {
+		return nil, status.Error(codes.FailedPrecondition, err.Error())
+	}
 	bindings := []*MiddlewareBinding{{
 		Operation:       SupervisorMiddlewareOperation_SUPERVISOR_MIDDLEWARE_OPERATION_HTTP_REQUEST,
 		Phase:           SupervisorMiddlewarePhase_SUPERVISOR_MIDDLEWARE_PHASE_PRE_CREDENTIALS,
@@ -159,6 +163,7 @@ func (s *Service) Describe(context.Context, *emptypb.Empty) (*MiddlewareManifest
 		ServiceVersion:   s.version,
 		ExpectedAudience: s.audience,
 		Bindings:         bindings,
+		Extension:        peerMetadata(s.version),
 	}, nil
 }
 

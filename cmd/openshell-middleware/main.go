@@ -94,6 +94,7 @@ func main() {
 	userEmail := flag.String("user-email", "", "requester passed on enforce, optional")
 	unnamed := flag.String("unnamed", "deny", "what to do with traffic that names no tool: deny or allow")
 	audit := flag.Bool("audit", true, "record decisions the control plane never sees")
+	capturePlan := flag.Bool("capture-plan", false, "read model replies on the response path and hold each sandbox to the plan they issue; needs a gateway that dispatches HTTP_RESPONSE/PRE_RETURN")
 	flag.Parse()
 
 	// Their contract accepts 10ms to 30s and treats the operator's service
@@ -119,6 +120,22 @@ func main() {
 		// Only when we are enforcing. The skeleton has no config to be wrong.
 		opts = append(opts, openshell.WithConfigValidator(openshell.ValidateIntentConfig))
 	}
+
+	// One store, written by the response hook and read by the request hook.
+	// Both are served from this process, which is what lets a plan read off a
+	// reply govern the call that follows it.
+	if *capturePlan {
+		iv, ok := run.verifier.(*openshell.IntentVerifier)
+		if !ok {
+			log.Fatal("-capture-plan needs -iap-url: the skeleton verifier has nothing to hold a plan against")
+		}
+		capture := openshell.NewPlanCapture()
+		iv.WithCapture(capture)
+		opts = append(opts, openshell.WithResponseBinding())
+		openshell.RegisterHttpResponsePreReturnServer(srv, openshell.NewResponseService(capture))
+		run.mode += ", capturing plans from model replies"
+	}
+
 	svc := openshell.New(*name, version(), run.verifier, opts...)
 	openshell.RegisterSupervisorMiddlewareServer(srv, svc)
 

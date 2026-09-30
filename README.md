@@ -1,7 +1,10 @@
 # ArmorIQ middleware for NVIDIA OpenShell
 
-Intent enforcement for agents running in [OpenShell](https://github.com/NVIDIA/openshell)
-sandboxes, as a supervisor middleware.
+Tool-level enforcement for agents running in
+[OpenShell](https://github.com/NVIDIA/openshell) sandboxes, as a supervisor middleware.
+On a gateway that dispatches responses to middleware, it also holds each sandbox to the
+plan its model issued, which is what intent enforcement needs. Stock OpenShell does not
+dispatch responses yet; see [Holding a sandbox to its model's plan](#holding-a-sandbox-to-its-models-plan).
 
 Nothing in OpenShell is modified. No fork, nothing installed inside the sandbox,
 and nothing added to the agent. This registers through OpenShell's own middleware
@@ -34,6 +37,36 @@ Two checks run per request:
 The first check is what makes this more than an authorization proxy. Asking whether
 a policy permits a tool the sandbox never declared answers a different question from
 the one being asked.
+
+## Holding a sandbox to its model's plan
+
+Both checks above are about what the sandbox may do. Neither sees what the agent set
+out to do for the task in hand, because that first appears in the model's reply, and
+stock OpenShell calls no middleware on responses.
+
+With `-capture-plan`, the service also registers on the response path. It reads each
+model reply on its way back to the sandbox and records the tool calls it asks for.
+Every later request is checked against that plan as well, after the declared scope and
+before policy:
+
+| check | comes from | refuses |
+| --- | --- | --- |
+| declared scope | `declared_tools`, written once by whoever creates the sandbox | a tool the sandbox was never set up to use |
+| captured plan | the model's latest reply, for this task | a tool the model did not ask for |
+| policy | the ArmorIQ control plane | a tool the agent is not permitted to call |
+
+A call the model did not ask for is refused with `intent_drift_from_plan`, without
+consulting policy. A reply that asks for no tools is recorded as an empty plan, so a
+call made after the model has finished is refused too. The reply is read before the
+sandbox receives it, so the plan is in place before the agent can act on it.
+
+**This needs a gateway that dispatches `HTTP_RESPONSE/PRE_RETURN`.** Stock OpenShell
+rejects that binding at registration and then refuses to start, so leave
+`-capture-plan` off unless the gateway dispatches the response path.
+
+Set `require_captured_plan: true` in a sandbox's middleware config to refuse tool calls
+made before any model reply has been seen. Without it, a sandbox is held to its plan
+once one exists, which is the safer default while rolling this out.
 
 ## Quick start
 
@@ -130,6 +163,7 @@ network_middlewares:
     config:
       agent_id: "<the agent this sandbox runs>"
       declared_tools: ["your_read_tool", "your_write_tool"]
+      # require_captured_plan: true   # only with -capture-plan, see above
     endpoints:
       include: ["mcp.example.internal"]
 ```
@@ -152,6 +186,7 @@ service.
 | `-timeout` | `450ms` | binding timeout to declare, between 10ms and 30s |
 | `-max-body` | `262144` | largest body accepted buffered |
 | `-audit` | `true` | record decisions the control plane does not see |
+| `-capture-plan` | `false` | read model replies and hold each sandbox to the plan they issue. Needs a gateway that dispatches responses |
 | `-name` | `armoriq-intent` | manifest name, diagnostic only |
 | `-deny` | `false` | deny everything, to prove the path end to end |
 | `-dump-request` | `false` | log the whole evaluation proto |
@@ -164,6 +199,7 @@ Only a short reason code reaches the requester. Everything else stays in the log
 | --- | --- |
 | `intent_blocked_by_policy` | a policy refused it |
 | `tool_not_in_plan` | not among the tools the sandbox declared |
+| `intent_drift_from_plan` | not asked for by the model's latest reply, with `-capture-plan` |
 | `intent_awaiting_approval` | the decision needs a human; the call does not proceed |
 | `intent_plan_not_found` | the sandbox declares no agent, so no agent policy applies |
 | `intent_action_not_named` | no tool could be identified in the request |
@@ -200,8 +236,17 @@ decision path and a full buffer drops rows rather than delaying a decision.
 - **The declared tool set is written by whoever creates the sandbox**, not declared
   by the agent. It is a scope boundary for the sandbox rather than a per task
   declaration.
-- **Requests only.** Responses are not inspected, so data returning to the sandbox
-  is not covered.
+- **Responses only with `-capture-plan` on a patched gateway.** Without both, nothing
+  returning to the sandbox is inspected. With them, model replies are read, never
+  changed or blocked.
+- **The plan is what the model asked for, not what the user asked for.** It catches an
+  agent acting outside its own model's instructions. It does not catch a model that has
+  itself been steered, for example by instructions injected into a tool result: the
+  model's next reply then asks for the injected call, and that call is in the plan.
+- **Replies are read when they are unencoded and not streamed.** OpenAI chat
+  completions and Anthropic messages are understood. A gzip body or an event stream is
+  delivered without its plan being read. The agent must name tools to the model the way
+  it names them to its MCP server, which is what MCP clients do.
 - **Traffic that names no tool** cannot be evaluated against a tool policy. The
   default is to deny it. `-unnamed allow` passes it through to your own network
   policy instead.
@@ -212,7 +257,7 @@ decision path and a full buffer drops rows rather than delaying a decision.
 
 ```
 cmd/openshell-middleware   the binary
-pkg/openshell              the gRPC service and the decision logic
+pkg/openshell              the gRPC services and the decision logic
 pkg/iapclient              the ArmorIQ control plane client
 proto/openshell            OpenShell's middleware contract, vendored
 ```

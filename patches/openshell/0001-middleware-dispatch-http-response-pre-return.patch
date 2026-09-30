@@ -1,0 +1,592 @@
+diff --git a/crates/openshell-supervisor-middleware/src/lib.rs b/crates/openshell-supervisor-middleware/src/lib.rs
+index e69b808..90c99fb 100644
+--- a/crates/openshell-supervisor-middleware/src/lib.rs
++++ b/crates/openshell-supervisor-middleware/src/lib.rs
+@@ -5,8 +5,11 @@
+ 
+ pub mod headers;
+ mod remote;
++mod response;
+ mod websocket;
+ 
++pub use response::{HttpResponseInput, ResponseStageOutcome};
++
+ pub use websocket::{
+     WebSocketCoverage, WebSocketCoverageState, WebSocketInvocation, WebSocketInvocationOutcome,
+     WebSocketMessageAdmission, WebSocketMessageOutcome, WebSocketMessageType,
+@@ -626,6 +629,16 @@ impl MiddlewareDispatch {
+             Self::Grpc(service) => service.open_websocket_session(receiver).await,
+         }
+     }
++
++    async fn open_http_response_pre_return(
++        &self,
++        receiver: tokio::sync::mpsc::Receiver<openshell_core::proto::HttpResponseEvent>,
++    ) -> std::result::Result<HttpResponseResultStream, tonic::Status> {
++        match self {
++            Self::InProcess(service) => service.open_http_response_pre_return(receiver).await,
++            Self::Grpc(service) => service.open_http_response_pre_return(receiver).await,
++        }
++    }
+ }
+ 
+ struct MiddlewareServiceState {
+@@ -836,6 +849,7 @@ fn validate_payload_limit(source: &str, binding: &MiddlewareBinding) -> Result<u
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ enum SupportedBinding {
+     HttpPreCredentials,
++    HttpResponsePreReturn,
+     WebSocketPreCredentials,
+ }
+ 
+@@ -851,9 +865,7 @@ fn supported_binding(source: &str, binding: &MiddlewareBinding) -> Result<Suppor
+         (
+             Some(SupervisorMiddlewareOperation::HttpResponse),
+             Some(SupervisorMiddlewarePhase::PreReturn),
+-        ) => Err(miette!(
+-            "{source} advertises HTTP_RESPONSE/PRE_RETURN, which is not yet supported"
+-        )),
++        ) => Ok(SupportedBinding::HttpResponsePreReturn),
+         (
+             Some(SupervisorMiddlewareOperation::WebsocketMessage),
+             Some(SupervisorMiddlewarePhase::PreCredentials),
+@@ -3721,7 +3733,7 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn manifest_rejects_http_response_pre_return_binding_until_dispatch_is_available() {
++    fn manifest_accepts_http_response_pre_return_binding() {
+         let registration = external_registration(4096);
+         let manifest = MiddlewareManifest {
+             name: "example/response".into(),
+@@ -3738,13 +3750,8 @@ mod tests {
+             expected_audience: String::new(),
+         };
+ 
+-        let error = validate_external_manifest(&registration, &manifest, 4096, false)
+-            .expect_err("HTTP response pre-return binding must remain unavailable");
+-        assert!(
+-            error
+-                .to_string()
+-                .contains("HTTP_RESPONSE/PRE_RETURN, which is not yet supported")
+-        );
++        validate_external_manifest(&registration, &manifest, 4096, false)
++            .expect("HTTP response pre-return binding is dispatched");
+     }
+ 
+     #[test]
+diff --git a/crates/openshell-supervisor-middleware/src/remote.rs b/crates/openshell-supervisor-middleware/src/remote.rs
+index 9443038..812b7f1 100644
+--- a/crates/openshell-supervisor-middleware/src/remote.rs
++++ b/crates/openshell-supervisor-middleware/src/remote.rs
+@@ -103,6 +103,14 @@ impl GrpcMiddlewareService {
+     ) -> std::result::Result<WebSocketResponseStream, Status> {
+         self.service.open_websocket_session(receiver).await
+     }
++
++    /// Open a remote HTTP response `PRE_RETURN` stream through the gRPC adapter.
++    pub async fn open_http_response_pre_return(
++        &self,
++        receiver: tokio::sync::mpsc::Receiver<HttpResponseEvent>,
++    ) -> std::result::Result<HttpResponseResultStream, Status> {
++        self.service.open_http_response_pre_return(receiver).await
++    }
+ }
+ 
+ #[derive(Clone)]
+diff --git a/crates/openshell-supervisor-middleware/src/response.rs b/crates/openshell-supervisor-middleware/src/response.rs
+new file mode 100644
+index 0000000..1390ae1
+--- /dev/null
++++ b/crates/openshell-supervisor-middleware/src/response.rs
+@@ -0,0 +1,490 @@
++// SPDX-License-Identifier: Apache-2.0
++
++//! HTTP response dispatch at `PRE_RETURN`.
++//!
++//! This drives the observe subset of the `HttpResponsePreReturn` contract. A
++//! stage may skip at preflight, or inspect with `WHOLE_BODY_BYTES` and pass the
++//! body through, and the response is always returned unchanged. Block delivery,
++//! body transforms, header and trailer mutations, and `STREAM_BYTES` are not
++//! implemented: a stage that selects one is ended and reported as failed, and
++//! delivery proceeds. Because nothing is ever blocked, `on_error` is not applied.
++
++use futures::StreamExt;
++use tokio::sync::mpsc;
++
++use openshell_core::proto::{
++    HttpHeader, HttpRequestTarget, HttpResponseBodyMode, HttpResponseBodyUnit, HttpResponseEvent,
++    HttpResponsePreflight, HttpResponseTrailers, MiddlewareSessionEnd, MiddlewareSessionEndReason,
++    RequestContext, http_response_body_result, http_response_body_skip_remaining,
++    http_response_body_unit, http_response_event, http_response_event_result,
++    http_response_preflight_result,
++};
++
++use super::{ChainRunner, DescribedChainEntry};
++
++const STREAM_CHANNEL_CAPACITY: usize = 4;
++
++/// A complete upstream response, offered to `PRE_RETURN` stages before any of
++/// it is returned to the sandbox.
++#[derive(Debug, Clone)]
++pub struct HttpResponseInput {
++    pub request_id: String,
++    pub sandbox_id: String,
++    pub sandbox_name: String,
++    pub workspace: String,
++    pub scheme: String,
++    pub host: String,
++    pub port: u16,
++    pub method: String,
++    pub path: String,
++    pub status_code: u32,
++    /// Response headers in wire order, repeated names kept separate.
++    pub headers: Vec<(String, String)>,
++    /// The body without transfer framing.
++    pub body: Vec<u8>,
++}
++
++/// What one `PRE_RETURN` stage did with a response.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum ResponseStageOutcome {
++    /// The stage declined to inspect at preflight.
++    Skipped,
++    /// The stage read the whole body and passed it through.
++    Observed,
++    /// The stage was unreachable, timed out, or answered outside the observe
++    /// subset. The reason is diagnostic only.
++    Failed(String),
++}
++
++impl ChainRunner {
++    /// Offer a complete response to each `PRE_RETURN` stage, in policy order.
++    ///
++    /// The caller must not return any of the response to the sandbox until this
++    /// completes. A stage that reads the reply to learn what the workload will
++    /// do next has to finish before the workload can act on it.
++    #[allow(clippy::unused_self)]
++    pub async fn observe_http_response(
++        &self,
++        entries: &[DescribedChainEntry],
++        input: &HttpResponseInput,
++    ) -> Vec<(String, ResponseStageOutcome)> {
++        let mut outcomes = Vec::with_capacity(entries.len());
++        for entry in entries {
++            let outcome = tokio::time::timeout(entry.timeout, observe_stage(entry, input))
++                .await
++                .unwrap_or_else(|_| ResponseStageOutcome::Failed("middleware_timeout".into()));
++            outcomes.push((entry.entry.implementation.clone(), outcome));
++        }
++        outcomes
++    }
++}
++
++fn failed(reason: &str) -> ResponseStageOutcome {
++    ResponseStageOutcome::Failed(reason.into())
++}
++
++fn event(event: http_response_event::Event) -> HttpResponseEvent {
++    HttpResponseEvent { event: Some(event) }
++}
++
++async fn end(sender: &mpsc::Sender<HttpResponseEvent>, reason: MiddlewareSessionEndReason) {
++    let _ = sender
++        .send(event(http_response_event::Event::SessionEnd(
++            MiddlewareSessionEnd {
++                reason: reason as i32,
++                protocol_error: None,
++            },
++        )))
++        .await;
++}
++
++async fn observe_stage(
++    entry: &DescribedChainEntry,
++    input: &HttpResponseInput,
++) -> ResponseStageOutcome {
++    let (Some(service), Some(_)) = (entry.service.as_ref(), entry.binding.as_ref()) else {
++        return failed("binding_not_described");
++    };
++
++    let whole_body_fits = input.body.len() <= entry.max_payload_bytes;
++    let mut permitted_body_modes = vec![HttpResponseBodyMode::HeadersOnly as i32];
++    if whole_body_fits {
++        permitted_body_modes.push(HttpResponseBodyMode::WholeBodyBytes as i32);
++    }
++    let preflight = HttpResponsePreflight {
++        context: Some(RequestContext {
++            request_id: input.request_id.clone(),
++            sandbox_id: input.sandbox_id.clone(),
++            sandbox_name: input.sandbox_name.clone(),
++            workspace: input.workspace.clone(),
++            originating_process: None,
++        }),
++        target: Some(HttpRequestTarget {
++            scheme: input.scheme.clone(),
++            host: input.host.clone(),
++            port: u32::from(input.port),
++            method: input.method.clone(),
++            path: input.path.clone(),
++            query: String::new(),
++        }),
++        status_code: input.status_code,
++        headers: input
++            .headers
++            .iter()
++            .map(|(name, value)| HttpHeader {
++                name: name.clone(),
++                value: value.clone(),
++            })
++            .collect(),
++        middleware_name: entry.entry.implementation.clone(),
++        config: Some(entry.entry.config.clone()),
++        max_payload_bytes: entry.max_payload_bytes as u64,
++        permitted_body_modes,
++    };
++
++    let (sender, receiver) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
++    if sender
++        .send(event(http_response_event::Event::Preflight(preflight)))
++        .await
++        .is_err()
++    {
++        return failed("request_stream_closed");
++    }
++    let mut results = match service
++        .service
++        .open_http_response_pre_return(receiver)
++        .await
++    {
++        Ok(results) => results,
++        Err(status) => return failed(&service.diagnostic_policy.error_reason(&status)),
++    };
++
++    let Some(Ok(result)) = results.next().await else {
++        return failed("missing_preflight_result");
++    };
++    let Some(http_response_event_result::Result::PreflightResult(preflight)) = result.result else {
++        end(&sender, MiddlewareSessionEndReason::MiddlewareFailure).await;
++        return failed("invalid_preflight_result");
++    };
++    match preflight.action {
++        Some(http_response_preflight_result::Action::Skip(_)) => {
++            end(&sender, MiddlewareSessionEndReason::StageSkipped).await;
++            return ResponseStageOutcome::Skipped;
++        }
++        Some(http_response_preflight_result::Action::Inspect(inspect))
++            if inspect.body_mode == HttpResponseBodyMode::WholeBodyBytes as i32
++                && whole_body_fits
++                && inspect.header_mutations.is_empty() => {}
++        Some(http_response_preflight_result::Action::Inspect(_)) => {
++            end(&sender, MiddlewareSessionEndReason::MiddlewareFailure).await;
++            return failed("inspect_outside_observe_subset");
++        }
++        Some(http_response_preflight_result::Action::BlockDelivery(_)) => {
++            end(&sender, MiddlewareSessionEndReason::MiddlewareFailure).await;
++            return failed("block_delivery_not_supported");
++        }
++        None => {
++            end(&sender, MiddlewareSessionEndReason::MiddlewareFailure).await;
++            return failed("missing_preflight_action");
++        }
++    }
++
++    if sender
++        .send(event(http_response_event::Event::Body(
++            HttpResponseBodyUnit {
++                sequence: 1,
++                payload: Some(http_response_body_unit::Payload::Data(input.body.clone())),
++                end_of_stream: true,
++            },
++        )))
++        .await
++        .is_err()
++    {
++        return failed("request_stream_closed");
++    }
++    let Some(Ok(result)) = results.next().await else {
++        return failed("missing_body_result");
++    };
++    let Some(http_response_event_result::Result::BodyResult(body)) = result.result else {
++        end(&sender, MiddlewareSessionEndReason::MiddlewareFailure).await;
++        return failed("invalid_body_result");
++    };
++    let passed_through = matches!(
++        body.action,
++        Some(
++            http_response_body_result::Action::PassThrough(_)
++                | http_response_body_result::Action::SkipRemaining(
++                    openshell_core::proto::HttpResponseBodySkipRemaining {
++                        current: Some(http_response_body_skip_remaining::Current::PassThrough(_)),
++                    }
++                )
++        )
++    );
++    if body.sequence != 1 || !passed_through {
++        end(&sender, MiddlewareSessionEndReason::MiddlewareFailure).await;
++        return failed("body_result_outside_observe_subset");
++    }
++
++    if sender
++        .send(event(http_response_event::Event::Trailers(
++            HttpResponseTrailers {
++                headers: Vec::new(),
++            },
++        )))
++        .await
++        .is_err()
++    {
++        return ResponseStageOutcome::Observed;
++    }
++    let _ = results.next().await;
++    end(&sender, MiddlewareSessionEndReason::Normal).await;
++    ResponseStageOutcome::Observed
++}
++
++#[cfg(test)]
++mod tests {
++    use std::sync::{Arc, Mutex};
++
++    use openshell_core::middleware::{
++        HttpRequestView, HttpResponseResultStream, InProcessMiddleware,
++    };
++    use openshell_core::proto::{
++        HttpRequestResult, HttpResponseBlockDelivery, HttpResponseBodyPassThrough,
++        HttpResponseBodyResult, HttpResponseEventResult, HttpResponsePreflightInspect,
++        HttpResponsePreflightResult, HttpResponsePreflightSkip, HttpResponseTrailersResult,
++        MiddlewareBinding, MiddlewareManifest, SupervisorMiddlewareOperation,
++        SupervisorMiddlewarePhase,
++    };
++
++    use super::*;
++    use crate::{ChainEntry, OnError};
++
++    #[derive(Clone, Copy)]
++    enum Reply {
++        Inspect,
++        Skip,
++        Block,
++    }
++
++    /// Answers each response event and records it before answering, so every
++    /// event that got a result is visible once `observe_http_response` returns.
++    struct Observer {
++        reply: Reply,
++        max_payload_bytes: u64,
++        seen: Arc<Mutex<Vec<HttpResponseEvent>>>,
++    }
++
++    #[tonic::async_trait]
++    impl InProcessMiddleware for Observer {
++        async fn describe(&self) -> MiddlewareManifest {
++            MiddlewareManifest {
++                name: "acme/observer".into(),
++                service_version: "test".into(),
++                bindings: vec![MiddlewareBinding {
++                    operation: SupervisorMiddlewareOperation::HttpResponse as i32,
++                    phase: SupervisorMiddlewarePhase::PreReturn as i32,
++                    max_payload_bytes: self.max_payload_bytes,
++                    request_timeout: None,
++                }],
++                expected_audience: String::new(),
++            }
++        }
++
++        async fn validate_config(&self, _: &str, _: &prost_types::Struct) -> miette::Result<()> {
++            Ok(())
++        }
++
++        async fn evaluate_http_request(
++            &self,
++            _: HttpRequestView<'_>,
++        ) -> miette::Result<HttpRequestResult> {
++            Ok(HttpRequestResult::default())
++        }
++
++        async fn open_http_response_pre_return(
++            &self,
++            mut requests: mpsc::Receiver<HttpResponseEvent>,
++        ) -> Result<HttpResponseResultStream, tonic::Status> {
++            let (tx, rx) = mpsc::channel(4);
++            let reply = self.reply;
++            let seen = self.seen.clone();
++            tokio::spawn(async move {
++                while let Some(ev) = requests.recv().await {
++                    seen.lock().expect("seen lock").push(ev.clone());
++                    let result = match ev.event {
++                        Some(http_response_event::Event::Preflight(_)) => {
++                            let action = match reply {
++                                Reply::Inspect => http_response_preflight_result::Action::Inspect(
++                                    HttpResponsePreflightInspect {
++                                        body_mode: HttpResponseBodyMode::WholeBodyBytes as i32,
++                                        header_mutations: Vec::new(),
++                                    },
++                                ),
++                                Reply::Skip => http_response_preflight_result::Action::Skip(
++                                    HttpResponsePreflightSkip {},
++                                ),
++                                Reply::Block => {
++                                    http_response_preflight_result::Action::BlockDelivery(
++                                        HttpResponseBlockDelivery {},
++                                    )
++                                }
++                            };
++                            http_response_event_result::Result::PreflightResult(
++                                HttpResponsePreflightResult {
++                                    action: Some(action),
++                                    ..Default::default()
++                                },
++                            )
++                        }
++                        Some(http_response_event::Event::Body(body)) => {
++                            http_response_event_result::Result::BodyResult(HttpResponseBodyResult {
++                                sequence: body.sequence,
++                                action: Some(http_response_body_result::Action::PassThrough(
++                                    HttpResponseBodyPassThrough {},
++                                )),
++                                ..Default::default()
++                            })
++                        }
++                        Some(http_response_event::Event::Trailers(_)) => {
++                            http_response_event_result::Result::TrailersResult(
++                                HttpResponseTrailersResult::default(),
++                            )
++                        }
++                        Some(http_response_event::Event::SessionEnd(_)) | None => continue,
++                    };
++                    let answer = HttpResponseEventResult {
++                        result: Some(result),
++                    };
++                    if tx.send(Ok(answer)).await.is_err() {
++                        break;
++                    }
++                }
++            });
++            Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
++        }
++    }
++
++    fn input(body: &[u8]) -> HttpResponseInput {
++        HttpResponseInput {
++            request_id: "req-1".into(),
++            sandbox_id: "sbx-1".into(),
++            sandbox_name: "demo".into(),
++            workspace: "ws".into(),
++            scheme: "https".into(),
++            host: "model.internal".into(),
++            port: 443,
++            method: "POST".into(),
++            path: "/v1/chat/completions".into(),
++            status_code: 200,
++            headers: vec![("content-type".into(), "application/json".into())],
++            body: body.to_vec(),
++        }
++    }
++
++    async fn observe(
++        reply: Reply,
++        max_payload_bytes: u64,
++        body: &[u8],
++    ) -> (ResponseStageOutcome, Vec<HttpResponseEvent>) {
++        let seen = Arc::new(Mutex::new(Vec::new()));
++        let runner = ChainRunner::new(Arc::new(Observer {
++            reply,
++            max_payload_bytes,
++            seen: seen.clone(),
++        }));
++        let entries = [ChainEntry {
++            name: "observer".into(),
++            implementation: "acme/observer".into(),
++            order: 0,
++            config: prost_types::Struct::default(),
++            on_error: OnError::FailClosed,
++        }];
++        let described = runner
++            .describe_http_response_chain(&entries)
++            .await
++            .expect("describe response chain");
++        assert_eq!(described.len(), 1, "response binding was not selected");
++        let mut outcomes = runner.observe_http_response(&described, &input(body)).await;
++        let (_, outcome) = outcomes.remove(0);
++        let events = seen.lock().expect("seen lock").clone();
++        (outcome, events)
++    }
++
++    fn preflight_of(events: &[HttpResponseEvent]) -> &HttpResponsePreflight {
++        match events.first().and_then(|ev| ev.event.as_ref()) {
++            Some(http_response_event::Event::Preflight(p)) => p,
++            other => panic!("first event is {other:?}, want preflight"),
++        }
++    }
++
++    #[tokio::test]
++    async fn the_whole_body_reaches_the_stage_before_observe_returns() {
++        let body = br#"{"object":"chat.completion"}"#;
++        let (outcome, events) = observe(Reply::Inspect, 4096, body).await;
++        assert_eq!(outcome, ResponseStageOutcome::Observed);
++
++        let preflight = preflight_of(&events);
++        assert_eq!(preflight.status_code, 200);
++        assert_eq!(
++            preflight.context.as_ref().map(|c| c.sandbox_id.as_str()),
++            Some("sbx-1"),
++            "the stage keys plans by sandbox id, as the request hook does"
++        );
++        assert!(
++            preflight
++                .permitted_body_modes
++                .contains(&(HttpResponseBodyMode::WholeBodyBytes as i32))
++        );
++
++        match events.get(1).and_then(|ev| ev.event.as_ref()) {
++            Some(http_response_event::Event::Body(unit)) => {
++                assert_eq!(unit.sequence, 1);
++                assert!(unit.end_of_stream);
++                assert_eq!(
++                    unit.payload,
++                    Some(http_response_body_unit::Payload::Data(body.to_vec()))
++                );
++            }
++            other => panic!("second event is {other:?}, want the whole body"),
++        }
++        assert!(matches!(
++            events.get(2).and_then(|ev| ev.event.as_ref()),
++            Some(http_response_event::Event::Trailers(_))
++        ));
++    }
++
++    #[tokio::test]
++    async fn a_preflight_skip_sends_no_body() {
++        let (outcome, events) = observe(Reply::Skip, 4096, b"{}").await;
++        assert_eq!(outcome, ResponseStageOutcome::Skipped);
++        assert!(
++            !events
++                .iter()
++                .any(|ev| matches!(ev.event, Some(http_response_event::Event::Body(_)))),
++            "a skipped stage was sent the body"
++        );
++    }
++
++    #[tokio::test]
++    async fn whole_body_mode_is_withheld_over_capacity() {
++        let (outcome, events) = observe(Reply::Inspect, 4, b"longer than four").await;
++        let preflight = preflight_of(&events);
++        assert_eq!(
++            preflight.permitted_body_modes,
++            vec![HttpResponseBodyMode::HeadersOnly as i32]
++        );
++        assert_eq!(
++            outcome,
++            ResponseStageOutcome::Failed("inspect_outside_observe_subset".into())
++        );
++    }
++
++    #[tokio::test]
++    async fn block_delivery_is_reported_not_applied() {
++        let (outcome, _) = observe(Reply::Block, 4096, b"{}").await;
++        assert_eq!(
++            outcome,
++            ResponseStageOutcome::Failed("block_delivery_not_supported".into())
++        );
++    }
++}

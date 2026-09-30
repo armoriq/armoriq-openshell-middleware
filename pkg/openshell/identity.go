@@ -61,6 +61,10 @@ func ValidateIntentConfig(cfg *structpb.Struct) error {
 			if _, ok := v.GetKind().(*structpb.Value_StringValue); !ok {
 				return fmt.Errorf("%s must be a string", k)
 			}
+		case ConfigRequireCapturedPlan:
+			if _, ok := v.GetKind().(*structpb.Value_BoolValue); !ok {
+				return fmt.Errorf("%s must be true or false", k)
+			}
 		case ConfigDeclaredTools:
 			list := v.GetListValue()
 			if list == nil {
@@ -77,8 +81,8 @@ func ValidateIntentConfig(cfg *structpb.Struct) error {
 	}
 	if len(unknown) > 0 {
 		sort.Strings(unknown)
-		return fmt.Errorf("unknown config key %v, accepted keys are %s, %s and %s",
-			unknown, ConfigAgentID, ConfigUserEmail, ConfigDeclaredTools)
+		return fmt.Errorf("unknown config key %v, accepted keys are %s, %s, %s and %s",
+			unknown, ConfigAgentID, ConfigUserEmail, ConfigDeclaredTools, ConfigRequireCapturedPlan)
 	}
 	return nil
 }

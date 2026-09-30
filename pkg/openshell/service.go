@@ -83,6 +83,11 @@ type Service struct {
 	// operator's value, so it is a ceiling on our own latency, not a request
 	// for more room.
 	timeout time.Duration
+
+	// responseBinding advertises HTTP_RESPONSE/PRE_RETURN as well. Off by
+	// default, because stock OpenShell rejects that binding and then refuses to
+	// start the gateway.
+	responseBinding bool
 }
 
 // New builds a Service. A nil verifier is a programming error rather than a
@@ -124,20 +129,36 @@ type ConfigValidator func(*structpb.Struct) error
 // watching, so a typo caught here is a typo that never reaches production.
 func WithConfigValidator(v ConfigValidator) Option { return func(s *Service) { s.validate = v } }
 
-// Describe returns the manifest. We declare only the HTTP request operation at
-// PRE_CREDENTIALS: that is where the workload's intent is visible, before
-// OpenShell injects credentials.
+// WithResponseBinding also advertises the response path, so model replies can
+// be read. Only for a gateway that dispatches it.
+func WithResponseBinding() Option { return func(s *Service) { s.responseBinding = true } }
+
+// Describe returns the manifest.
+//
+// The request binding at PRE_CREDENTIALS is where each action is decided,
+// before OpenShell injects credentials. The response binding at PRE_RETURN is
+// where the agent's intent first appears, in the model's reply, and is declared
+// only when enabled.
 func (s *Service) Describe(context.Context, *emptypb.Empty) (*MiddlewareManifest, error) {
+	bindings := []*MiddlewareBinding{{
+		Operation:       SupervisorMiddlewareOperation_SUPERVISOR_MIDDLEWARE_OPERATION_HTTP_REQUEST,
+		Phase:           SupervisorMiddlewarePhase_SUPERVISOR_MIDDLEWARE_PHASE_PRE_CREDENTIALS,
+		MaxPayloadBytes: s.maxBody,
+		RequestTimeout:  durationpb.New(s.timeout),
+	}}
+	if s.responseBinding {
+		bindings = append(bindings, &MiddlewareBinding{
+			Operation:       SupervisorMiddlewareOperation_SUPERVISOR_MIDDLEWARE_OPERATION_HTTP_RESPONSE,
+			Phase:           SupervisorMiddlewarePhase_SUPERVISOR_MIDDLEWARE_PHASE_PRE_RETURN,
+			MaxPayloadBytes: s.maxBody,
+			RequestTimeout:  durationpb.New(s.timeout),
+		})
+	}
 	return &MiddlewareManifest{
 		Name:             s.name,
 		ServiceVersion:   s.version,
 		ExpectedAudience: s.audience,
-		Bindings: []*MiddlewareBinding{{
-			Operation:       SupervisorMiddlewareOperation_SUPERVISOR_MIDDLEWARE_OPERATION_HTTP_REQUEST,
-			Phase:           SupervisorMiddlewarePhase_SUPERVISOR_MIDDLEWARE_PHASE_PRE_CREDENTIALS,
-			MaxPayloadBytes: s.maxBody,
-			RequestTimeout:  durationpb.New(s.timeout),
-		}},
+		Bindings:         bindings,
 	}, nil
 }
 

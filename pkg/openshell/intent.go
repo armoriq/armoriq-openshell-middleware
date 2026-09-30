@@ -86,6 +86,11 @@ type IntentVerifier struct {
 	// here would double count them.
 	audit *iapclient.AuditBuffer
 
+	// capture is the plan the model most recently issued to each sandbox, read
+	// off the response path. Nil when the gateway does not dispatch responses,
+	// in which case only the declared scope and policy apply.
+	capture *PlanCapture
+
 	// slowAfter logs a decision that ate most of the budget. Being told late is
 	// how a 500ms ceiling turns into denied traffic in production.
 	slowAfter time.Duration
@@ -119,6 +124,12 @@ func NewIntentVerifier(c *iapclient.Client, r Resolver, unnamed UnnamedAction, s
 // denials exist only in OpenShell's log and ours.
 func (v *IntentVerifier) WithAudit(b *iapclient.AuditBuffer) *IntentVerifier {
 	v.audit = b
+	return v
+}
+
+// WithCapture holds each sandbox to the plan its model last issued.
+func (v *IntentVerifier) WithCapture(c *PlanCapture) *IntentVerifier {
+	v.capture = c
 	return v
 }
 
@@ -174,6 +185,34 @@ func (v *IntentVerifier) decide(ctx context.Context, req *HttpRequestEvaluation,
 		return Verdict{Allow: false, Code: CodeNotInPlan,
 			Reason: fmt.Sprintf("%s is not in the plan sandbox %s declared (%s)",
 				act.Tool, sandbox, strings.Join(declared, ", "))}, id, false, nil
+	}
+
+	// The captured plan is narrower than the declared scope: it is what the
+	// model asked for in its latest reply, for the task in hand. A call can be
+	// inside the scope and allowed by policy and still be one the model never
+	// asked for, and this is the only check that sees that.
+	//
+	// A policy that requires a plan is refused outright when this service is not
+	// capturing any. Skipping the check would leave the policy believing it is
+	// enforced when nothing could ever satisfy it.
+	required := RequireCapturedPlan(req.GetConfig())
+	if v.capture == nil && required {
+		return Verdict{Allow: false, Code: CodeDrift,
+			Reason: fmt.Sprintf("sandbox %s sets %s but this service is not capturing plans (-capture-plan is off)",
+				sandbox, ConfigRequireCapturedPlan)}, id, false, nil
+	}
+	if v.capture != nil {
+		plan, captured := v.capture.Lookup(sandbox)
+		switch {
+		case captured && !InPlan(plan, act.Tool):
+			return Verdict{Allow: false, Code: CodeDrift,
+				Reason: fmt.Sprintf("%s was not asked for by the model's last reply to sandbox %s, which asked for [%s]",
+					act.Tool, sandbox, strings.Join(plan, ", "))}, id, false, nil
+		case !captured && required:
+			return Verdict{Allow: false, Code: CodeDrift,
+				Reason: fmt.Sprintf("%s called before any model reply was seen for sandbox %s, and the policy sets %s",
+					act.Tool, sandbox, ConfigRequireCapturedPlan)}, id, false, nil
+		}
 	}
 
 	// The token carries the plan to the control plane. Without it there is no

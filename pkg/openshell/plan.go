@@ -18,8 +18,11 @@ import (
 //	  agent_id: "..."
 //	  declared_tools: ["github_list_issues", "github_create_issue"]
 //
-// This is the plan. Without it we can only ask whether a policy permits a tool,
-// which is a weaker question than whether the sandbox said it would use it.
+// This is the operator's scope for the sandbox, written once at creation. It is
+// not the agent's plan for a task: that only appears in the model's reply, and
+// is what PlanCapture holds. Without this list we can only ask whether a policy
+// permits a tool, which is a weaker question than whether the sandbox was set up
+// to use it.
 const ConfigDeclaredTools = "declared_tools"
 
 // CodeNotInPlan is drift: a tool the sandbox never declared. It is a separate

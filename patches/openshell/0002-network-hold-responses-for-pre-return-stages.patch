@@ -1,0 +1,749 @@
+diff --git a/crates/openshell-supervisor-network/src/l7/middleware.rs b/crates/openshell-supervisor-network/src/l7/middleware.rs
+index f2df288..4777a64 100644
+--- a/crates/openshell-supervisor-network/src/l7/middleware.rs
++++ b/crates/openshell-supervisor-network/src/l7/middleware.rs
+@@ -423,6 +423,44 @@ pub(super) fn middleware_chain_body_limit(
+         .max()
+ }
+ 
++/// Select the `PRE_RETURN` stages for a request the request chain allowed.
++///
++/// Returns `None` when no attached middleware advertises the response binding,
++/// which leaves the response relayed exactly as it is without one.
++pub async fn response_middleware_for<'a>(
++    chain: &[openshell_supervisor_middleware::ChainEntry],
++    runner: &'a openshell_supervisor_middleware::ChainRunner,
++    ctx: &L7EvalContext,
++    scheme: &str,
++    req: &crate::l7::provider::L7Request,
++) -> Option<crate::l7::rest::ResponseMiddleware<'a>> {
++    if chain.is_empty() {
++        return None;
++    }
++    let entries: Vec<_> = match runner.describe_http_response_chain(chain).await {
++        Ok(entries) => entries
++            .into_iter()
++            .filter(openshell_supervisor_middleware::DescribedChainEntry::is_resolved)
++            .collect(),
++        Err(error) => {
++            tracing::warn!(error = %error, "PRE_RETURN stages unavailable, response relayed unobserved");
++            return None;
++        }
++    };
++    if entries.is_empty() {
++        return None;
++    }
++    Some(crate::l7::rest::ResponseMiddleware {
++        runner,
++        entries,
++        scheme: scheme.to_string(),
++        host: ctx.host.clone(),
++        port: ctx.port,
++        workspace: ctx.workspace.clone(),
++        path: req.target.clone(),
++    })
++}
++
+ pub async fn apply_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Send>(
+     req: crate::l7::provider::L7Request,
+     client: &mut C,
+diff --git a/crates/openshell-supervisor-network/src/l7/relay.rs b/crates/openshell-supervisor-network/src/l7/relay.rs
+index 9b97b46..1e5a7b2 100644
+--- a/crates/openshell-supervisor-network/src/l7/relay.rs
++++ b/crates/openshell-supervisor-network/src/l7/relay.rs
+@@ -967,6 +967,7 @@ where
+ 
+         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
+             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
++            let response_chain = chain.clone();
+             let websocket_chain = websocket_request.then(|| chain.clone());
+             // Route selection resolved `config` per request, so re-check the
+             // body against that protocol's policy after every transforming
+@@ -1081,6 +1082,14 @@ where
+             } else {
+                 None
+             };
++            let response_middleware = crate::l7::middleware::response_middleware_for(
++                &response_chain,
++                engine.middleware_runner(),
++                ctx,
++                "https",
++                &req,
++            )
++            .await;
+             let outcome_result = relay_http_request_with_credential_rejection_observed(
+                 &req,
+                 client,
+@@ -1103,6 +1112,7 @@ where
+                     signing_region: &config.signing_region,
+                     host: &ctx.host,
+                     port: ctx.port,
++                    response_middleware: response_middleware.as_ref(),
+                 },
+                 ctx,
+                 observer.as_ref(),
+@@ -1722,6 +1732,7 @@ where
+ 
+         if allowed || config.enforcement == EnforcementMode::Audit {
+             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
++            let response_chain = chain.clone();
+             let websocket_chain = websocket_request.then(|| chain.clone());
+             // REST and websocket-upgrade policy evaluates only the method,
+             // path, and query, which a middleware result cannot mutate, so no
+@@ -1825,6 +1836,14 @@ where
+             let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
+ 
+             // Forward request to upstream and relay response
++            let response_middleware = crate::l7::middleware::response_middleware_for(
++                &response_chain,
++                engine.middleware_runner(),
++                ctx,
++                "https",
++                &req_with_auth,
++            )
++            .await;
+             let outcome_result = relay_http_request_with_credential_rejection(
+                 &req_with_auth,
+                 client,
+@@ -1847,6 +1866,7 @@ where
+                     signing_region: &config.signing_region,
+                     host: &ctx.host,
+                     port: ctx.port,
++                    response_middleware: response_middleware.as_ref(),
+                 },
+                 ctx,
+             )
+diff --git a/crates/openshell-supervisor-network/src/l7/rest.rs b/crates/openshell-supervisor-network/src/l7/rest.rs
+index bf5c99e..54843d4 100644
+--- a/crates/openshell-supervisor-network/src/l7/rest.rs
++++ b/crates/openshell-supervisor-network/src/l7/rest.rs
+@@ -736,6 +736,7 @@ where
+             signing_region: "",
+             host: "",
+             port: 0,
++            response_middleware: None,
+         },
+     )
+     .await
+@@ -762,6 +763,34 @@ pub(crate) struct RelayRequestOptions<'a> {
+     pub(crate) signing_region: &'a str,
+     pub(crate) host: &'a str,
+     pub(crate) port: u16,
++    /// `PRE_RETURN` stages for this request. `None` relays the response as it
++    /// arrives, which is the only behavior without a response-bound middleware.
++    pub(crate) response_middleware: Option<&'a ResponseMiddleware<'a>>,
++}
++
++/// `PRE_RETURN` stages selected for one request the request chain allowed, and
++/// what a preflight needs that the response itself does not carry.
++pub(crate) struct ResponseMiddleware<'a> {
++    pub(crate) runner: &'a openshell_supervisor_middleware::ChainRunner,
++    pub(crate) entries: Vec<openshell_supervisor_middleware::DescribedChainEntry>,
++    pub(crate) scheme: String,
++    pub(crate) host: String,
++    pub(crate) port: u16,
++    pub(crate) workspace: String,
++    pub(crate) path: String,
++}
++
++impl ResponseMiddleware<'_> {
++    /// The most any stage accepts as a whole body. Nothing larger can be
++    /// offered, so it is relayed without being held.
++    fn hold_limit(&self) -> usize {
++        self.entries
++            .iter()
++            .map(openshell_supervisor_middleware::DescribedChainEntry::max_payload_bytes)
++            .max()
++            .unwrap_or(0)
++            .min(openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES)
++    }
+ }
+ 
+ #[derive(Clone, Copy)]
+@@ -1212,6 +1241,7 @@ where
+             websocket: websocket_response,
+             client_requested_upgrade,
+             observer,
++            response_middleware: options.response_middleware,
+         },
+     )
+     .await?;
+@@ -3239,6 +3269,7 @@ struct RelayResponseOptions<'a> {
+     client_requested_upgrade: bool,
+     websocket: Option<WebSocketResponseValidation>,
+     observer: Option<&'a EndpointObserver>,
++    response_middleware: Option<&'a ResponseMiddleware<'a>>,
+ }
+ 
+ impl Default for RelayResponseOptions<'_> {
+@@ -3248,6 +3279,7 @@ impl Default for RelayResponseOptions<'_> {
+             client_requested_upgrade: true,
+             websocket: None,
+             observer: None,
++            response_middleware: None,
+         }
+     }
+ }
+@@ -3439,6 +3471,24 @@ where
+         return Ok(RelayOutcome::Reusable);
+     }
+ 
++    if let Some(response) = options.response_middleware
++        && !event_stream
++        && !response_is_content_encoded(&header_str)
++        && let Some(outcome) = observe_and_relay_response(
++            response,
++            request_method,
++            status_code,
++            &buf,
++            header_end,
++            body_length,
++            upstream,
++            client,
++        )
++        .await?
++    {
++        return Ok(outcome);
++    }
++
+     // Forward response headers + any overflow body bytes
+     client.write_all(&buf).await.into_diagnostic()?;
+     let overflow_len = (buf.len() - header_end) as u64;
+@@ -3472,6 +3522,201 @@ where
+     Ok(RelayOutcome::Reusable)
+ }
+ 
++/// Hold one response until its `PRE_RETURN` stages have seen it, then relay it
++/// byte for byte.
++///
++/// Nothing reaches the sandbox before the stages finish. A stage that reads the
++/// reply to learn what the workload will do next has to be done before the
++/// workload can act on it, or its next request is judged against stale state.
++///
++/// Returns `None` when the response cannot be held, and the caller relays it as
++/// it would without a response-bound middleware.
++#[allow(clippy::too_many_arguments)]
++async fn observe_and_relay_response<U, C>(
++    response: &ResponseMiddleware<'_>,
++    request_method: &str,
++    status_code: u16,
++    buf: &[u8],
++    header_end: usize,
++    body_length: BodyLength,
++    upstream: &mut U,
++    client: &mut C,
++) -> Result<Option<RelayOutcome>>
++where
++    U: AsyncRead + Unpin,
++    C: AsyncWrite + Unpin,
++{
++    let limit = response.hold_limit();
++    let overflow = &buf[header_end..];
++    let (raw, body) = match body_length {
++        BodyLength::ContentLength(len) => {
++            let Ok(len) = usize::try_from(len) else {
++                return Ok(None);
++            };
++            if len > limit {
++                return Ok(None);
++            }
++            let mut raw = overflow.to_vec();
++            let remaining = len.saturating_sub(raw.len());
++            if remaining > 0 {
++                relay_fixed(upstream, &mut raw, remaining as u64, None).await?;
++            }
++            let body = raw[..len.min(raw.len())].to_vec();
++            (raw, body)
++        }
++        BodyLength::Chunked => {
++            let mut held = HeldBody {
++                bytes: overflow.to_vec(),
++                limit,
++                over_limit: false,
++            };
++            if let Err(error) = relay_chunked(upstream, &mut held, overflow, None).await {
++                if !held.over_limit {
++                    return Err(error);
++                }
++                // Too large to offer any stage. Deliver what was read, then relay
++                // the rest as it arrives, re-parsing from what was already sent.
++                client
++                    .write_all(&buf[..header_end])
++                    .await
++                    .into_diagnostic()?;
++                client.write_all(&held.bytes).await.into_diagnostic()?;
++                relay_chunked(upstream, client, &held.bytes, None).await?;
++                client.flush().await.into_diagnostic()?;
++                return Ok(Some(RelayOutcome::Reusable));
++            }
++            let body = dechunk(&held.bytes).unwrap_or_default();
++            (held.bytes, body)
++        }
++        BodyLength::None => return Ok(None),
++    };
++
++    let header_str = String::from_utf8_lossy(&buf[..header_end]);
++    let sandbox = ocsf_ctx();
++    let input = openshell_supervisor_middleware::HttpResponseInput {
++        request_id: uuid::Uuid::new_v4().to_string(),
++        sandbox_id: sandbox.sandbox_id.clone(),
++        sandbox_name: sandbox.sandbox_name.clone(),
++        workspace: response.workspace.clone(),
++        scheme: response.scheme.clone(),
++        host: response.host.clone(),
++        port: response.port,
++        method: request_method.to_string(),
++        path: response.path.clone(),
++        status_code: u32::from(status_code),
++        headers: middleware_response_headers(&header_str),
++        body,
++    };
++    for (middleware, outcome) in response
++        .runner
++        .observe_http_response(&response.entries, &input)
++        .await
++    {
++        debug!(%middleware, ?outcome, status_code, "PRE_RETURN stage");
++    }
++
++    client
++        .write_all(&buf[..header_end])
++        .await
++        .into_diagnostic()?;
++    client.write_all(&raw).await.into_diagnostic()?;
++    client.flush().await.into_diagnostic()?;
++    Ok(Some(RelayOutcome::Reusable))
++}
++
++/// Collects a response body up to a limit.
++///
++/// Every byte it is handed is kept, including the write that crosses the limit,
++/// so a response that turns out too large is still delivered intact.
++struct HeldBody {
++    bytes: Vec<u8>,
++    limit: usize,
++    over_limit: bool,
++}
++
++impl AsyncWrite for HeldBody {
++    fn poll_write(
++        mut self: std::pin::Pin<&mut Self>,
++        _: &mut std::task::Context<'_>,
++        data: &[u8],
++    ) -> std::task::Poll<std::io::Result<usize>> {
++        self.bytes.extend_from_slice(data);
++        if self.bytes.len() > self.limit {
++            self.over_limit = true;
++            return std::task::Poll::Ready(Err(std::io::Error::other(
++                "held response exceeds the middleware payload limit",
++            )));
++        }
++        std::task::Poll::Ready(Ok(data.len()))
++    }
++
++    fn poll_flush(
++        self: std::pin::Pin<&mut Self>,
++        _: &mut std::task::Context<'_>,
++    ) -> std::task::Poll<std::io::Result<()>> {
++        std::task::Poll::Ready(Ok(()))
++    }
++
++    fn poll_shutdown(
++        self: std::pin::Pin<&mut Self>,
++        _: &mut std::task::Context<'_>,
++    ) -> std::task::Poll<std::io::Result<()>> {
++        std::task::Poll::Ready(Ok(()))
++    }
++}
++
++/// The payload of a complete chunked message, without framing or trailers.
++fn dechunk(raw: &[u8]) -> Option<Vec<u8>> {
++    let mut body = Vec::new();
++    let mut pos = 0;
++    loop {
++        let line_end = find_crlf(raw, pos)?;
++        let line = std::str::from_utf8(&raw[pos..line_end]).ok()?;
++        let size = usize::from_str_radix(line.split(';').next()?.trim(), 16).ok()?;
++        pos = line_end + 2;
++        if size == 0 {
++            return Some(body);
++        }
++        let end = pos.checked_add(size)?;
++        body.extend_from_slice(raw.get(pos..end)?);
++        pos = end.checked_add(2)?;
++    }
++}
++
++/// A body stages cannot read without decoding it first. The contract offers
++/// these only headers-only, and this observe path does not decode.
++fn response_is_content_encoded(headers: &str) -> bool {
++    headers.lines().skip(1).any(|line| {
++        line.split_once(':').is_some_and(|(name, value)| {
++            name.trim().eq_ignore_ascii_case("content-encoding")
++                && !value.trim().eq_ignore_ascii_case("identity")
++        })
++    })
++}
++
++/// Response headers for a preflight, in wire order, without hop-by-hop fields
++/// or cookies.
++fn middleware_response_headers(headers: &str) -> Vec<(String, String)> {
++    const WITHHELD: &[&str] = &[
++        "connection",
++        "keep-alive",
++        "proxy-authenticate",
++        "proxy-connection",
++        "set-cookie",
++        "te",
++        "trailer",
++        "transfer-encoding",
++        "upgrade",
++    ];
++    headers
++        .lines()
++        .skip(1)
++        .filter_map(|line| line.split_once(':'))
++        .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
++        .filter(|(name, _)| !name.is_empty() && !WITHHELD.contains(&name.as_str()))
++        .collect()
++}
++
+ /// Parse the HTTP status code from a response status line.
+ ///
+ /// Expects the first line to look like `HTTP/1.1 200 OK`.
+@@ -8646,3 +8891,323 @@ mod tests {
+         );
+     }
+ }
++
++#[cfg(test)]
++mod response_hold_tests {
++    use std::sync::{Arc, Mutex};
++
++    use openshell_core::middleware::{
++        HttpRequestView, HttpResponseResultStream, InProcessMiddleware,
++    };
++    use openshell_core::proto::{
++        HttpRequestResult, HttpResponseBodyMode, HttpResponseBodyPassThrough,
++        HttpResponseBodyResult, HttpResponseEvent, HttpResponseEventResult,
++        HttpResponsePreflightInspect, HttpResponsePreflightResult, HttpResponseTrailersResult,
++        MiddlewareBinding, MiddlewareManifest, SupervisorMiddlewareOperation,
++        SupervisorMiddlewarePhase, http_response_body_result, http_response_body_unit,
++        http_response_event, http_response_event_result, http_response_preflight_result,
++    };
++    use openshell_supervisor_middleware::{ChainEntry, ChainRunner, OnError};
++    use tokio::io::{AsyncReadExt, AsyncWriteExt};
++    use tokio::sync::{Notify, mpsc};
++
++    use super::*;
++
++    /// A `PRE_RETURN` stage that records each body it is offered. With a gate, it
++    /// holds its body result until the test releases it.
++    struct Recorder {
++        max_payload_bytes: u64,
++        bodies: Arc<Mutex<Vec<Vec<u8>>>>,
++        gate: Option<Arc<Notify>>,
++    }
++
++    #[tonic::async_trait]
++    impl InProcessMiddleware for Recorder {
++        async fn describe(&self) -> MiddlewareManifest {
++            MiddlewareManifest {
++                name: "acme/recorder".into(),
++                service_version: "test".into(),
++                bindings: vec![MiddlewareBinding {
++                    operation: SupervisorMiddlewareOperation::HttpResponse as i32,
++                    phase: SupervisorMiddlewarePhase::PreReturn as i32,
++                    max_payload_bytes: self.max_payload_bytes,
++                    request_timeout: None,
++                }],
++                expected_audience: String::new(),
++            }
++        }
++
++        async fn validate_config(&self, _: &str, _: &prost_types::Struct) -> Result<()> {
++            Ok(())
++        }
++
++        async fn evaluate_http_request(&self, _: HttpRequestView<'_>) -> Result<HttpRequestResult> {
++            Ok(HttpRequestResult::default())
++        }
++
++        async fn open_http_response_pre_return(
++            &self,
++            mut requests: mpsc::Receiver<HttpResponseEvent>,
++        ) -> std::result::Result<HttpResponseResultStream, tonic::Status> {
++            let (tx, rx) = mpsc::channel(4);
++            let bodies = self.bodies.clone();
++            let gate = self.gate.clone();
++            tokio::spawn(async move {
++                while let Some(ev) = requests.recv().await {
++                    let result = match ev.event {
++                        Some(http_response_event::Event::Preflight(_)) => {
++                            http_response_event_result::Result::PreflightResult(
++                                HttpResponsePreflightResult {
++                                    action: Some(http_response_preflight_result::Action::Inspect(
++                                        HttpResponsePreflightInspect {
++                                            body_mode: HttpResponseBodyMode::WholeBodyBytes as i32,
++                                            header_mutations: Vec::new(),
++                                        },
++                                    )),
++                                    ..Default::default()
++                                },
++                            )
++                        }
++                        Some(http_response_event::Event::Body(unit)) => {
++                            if let Some(http_response_body_unit::Payload::Data(data)) = unit.payload
++                            {
++                                bodies.lock().expect("bodies lock").push(data);
++                            }
++                            if let Some(gate) = gate.as_ref() {
++                                gate.notified().await;
++                            }
++                            http_response_event_result::Result::BodyResult(HttpResponseBodyResult {
++                                sequence: unit.sequence,
++                                action: Some(http_response_body_result::Action::PassThrough(
++                                    HttpResponseBodyPassThrough {},
++                                )),
++                                ..Default::default()
++                            })
++                        }
++                        Some(http_response_event::Event::Trailers(_)) => {
++                            http_response_event_result::Result::TrailersResult(
++                                HttpResponseTrailersResult::default(),
++                            )
++                        }
++                        Some(http_response_event::Event::SessionEnd(_)) | None => continue,
++                    };
++                    let answer = HttpResponseEventResult {
++                        result: Some(result),
++                    };
++                    if tx.send(Ok(answer)).await.is_err() {
++                        break;
++                    }
++                }
++            });
++            Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
++        }
++    }
++
++    struct Stages {
++        runner: ChainRunner,
++        bodies: Arc<Mutex<Vec<Vec<u8>>>>,
++    }
++
++    fn stages(max_payload_bytes: u64, gate: Option<Arc<Notify>>) -> Stages {
++        let bodies = Arc::new(Mutex::new(Vec::new()));
++        let runner = ChainRunner::new(Arc::new(Recorder {
++            max_payload_bytes,
++            bodies: bodies.clone(),
++            gate,
++        }));
++        Stages { runner, bodies }
++    }
++
++    async fn response_middleware(stages: &Stages) -> ResponseMiddleware<'_> {
++        let entries = stages
++            .runner
++            .describe_http_response_chain(&[ChainEntry {
++                name: "recorder".into(),
++                implementation: "acme/recorder".into(),
++                order: 0,
++                config: prost_types::Struct::default(),
++                on_error: OnError::FailClosed,
++            }])
++            .await
++            .expect("describe response chain");
++        assert_eq!(entries.len(), 1, "response binding was not selected");
++        ResponseMiddleware {
++            runner: &stages.runner,
++            entries,
++            scheme: "https".into(),
++            host: "model.internal".into(),
++            port: 443,
++            workspace: "ws".into(),
++            path: "/v1/chat/completions".into(),
++        }
++    }
++
++    /// Relays `response` with the given stages and returns what the client got.
++    async fn relay_held(response: &'static [u8], stages: &Stages) -> Vec<u8> {
++        let rm = response_middleware(stages).await;
++        let (mut upstream_read, mut upstream_write) = tokio::io::duplex(1 << 16);
++        let (mut client_read, mut client_write) = tokio::io::duplex(1 << 16);
++        tokio::spawn(async move {
++            upstream_write.write_all(response).await.unwrap();
++            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
++        });
++        let outcome = tokio::time::timeout(
++            std::time::Duration::from_secs(2),
++            relay_response(
++                "POST",
++                &mut upstream_read,
++                &mut client_write,
++                RelayResponseOptions {
++                    response_middleware: Some(&rm),
++                    ..Default::default()
++                },
++            ),
++        )
++        .await
++        .expect("relay must finish by framing")
++        .expect("relay_response");
++        assert!(matches!(outcome, RelayOutcome::Reusable));
++        client_write.shutdown().await.unwrap();
++        let mut received = Vec::new();
++        client_read.read_to_end(&mut received).await.unwrap();
++        received
++    }
++
++    fn bodies(stages: &Stages) -> Vec<Vec<u8>> {
++        stages.bodies.lock().expect("bodies lock").clone()
++    }
++
++    #[tokio::test]
++    async fn nothing_reaches_the_client_until_the_stage_has_answered() {
++        let response: &[u8] =
++            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 5\r\n\r\nhello";
++        let gate = Arc::new(Notify::new());
++        let stages = stages(4096, Some(gate.clone()));
++        let rm = response_middleware(&stages).await;
++
++        let (mut upstream_read, mut upstream_write) = tokio::io::duplex(4096);
++        let (mut client_read, mut client_write) = tokio::io::duplex(4096);
++        tokio::spawn(async move {
++            upstream_write.write_all(response).await.unwrap();
++            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
++        });
++        let outcome = {
++            let relay = relay_response(
++                "POST",
++                &mut upstream_read,
++                &mut client_write,
++                RelayResponseOptions {
++                    response_middleware: Some(&rm),
++                    ..Default::default()
++                },
++            );
++            tokio::pin!(relay);
++
++            // Drive the relay until the stage has the body and is holding it.
++            let waited = tokio::time::timeout(std::time::Duration::from_secs(2), async {
++            loop {
++                tokio::select! {
++                    _ = &mut relay => panic!("relay finished while the stage was still holding"),
++                    () = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
++                }
++                if !bodies(&stages).is_empty() {
++                    break;
++                }
++            }
++        })
++        .await;
++            assert!(waited.is_ok(), "stage never received the body");
++
++            let mut first = [0u8; 1];
++            let early = tokio::time::timeout(
++                std::time::Duration::from_millis(100),
++                client_read.read(&mut first),
++            )
++            .await;
++            assert!(
++                early.is_err(),
++                "client received bytes before the stage answered"
++            );
++
++            gate.notify_one();
++            tokio::time::timeout(std::time::Duration::from_secs(2), relay)
++                .await
++                .expect("relay finishes once released")
++                .expect("relay_response")
++        };
++        assert!(matches!(outcome, RelayOutcome::Reusable));
++
++        client_write.shutdown().await.unwrap();
++        let mut received = Vec::new();
++        client_read.read_to_end(&mut received).await.unwrap();
++        assert_eq!(received, response);
++        assert_eq!(bodies(&stages), vec![b"hello".to_vec()]);
++    }
++
++    #[tokio::test]
++    async fn a_chunked_reply_is_offered_without_framing_and_relayed_byte_for_byte() {
++        let response: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nhello \r\n5\r\nworld\r\n0\r\nx-checksum: abc\r\n\r\n";
++        let stages = stages(4096, None);
++        let received = relay_held(response, &stages).await;
++        assert_eq!(
++            received, response,
++            "the client must get the upstream bytes unchanged"
++        );
++        assert_eq!(bodies(&stages), vec![b"hello world".to_vec()]);
++    }
++
++    #[tokio::test]
++    async fn a_chunked_reply_over_the_limit_is_delivered_intact_and_unobserved() {
++        let response: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n14\r\n01234567890123456789\r\n14\r\nabcdefghijabcdefghij\r\n0\r\n\r\n";
++        let stages = stages(16, None);
++        let received = relay_held(response, &stages).await;
++        assert_eq!(received, response);
++        assert!(bodies(&stages).is_empty(), "an over-limit body was offered");
++    }
++
++    #[tokio::test]
++    async fn a_known_length_over_the_limit_is_not_held() {
++        let response: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\n01234567890123456789";
++        let stages = stages(16, None);
++        let received = relay_held(response, &stages).await;
++        assert_eq!(received, response);
++        assert!(bodies(&stages).is_empty());
++    }
++
++    #[tokio::test]
++    async fn an_encoded_reply_is_not_held() {
++        let response: &[u8] =
++            b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 5\r\n\r\nhello";
++        let stages = stages(4096, None);
++        let received = relay_held(response, &stages).await;
++        assert_eq!(received, response);
++        assert!(
++            bodies(&stages).is_empty(),
++            "stages cannot read an encoded body"
++        );
++    }
++
++    #[test]
++    fn dechunk_strips_framing_extensions_and_trailers() {
++        assert_eq!(
++            dechunk(b"3;ext=1\r\nabc\r\n2\r\nde\r\n0\r\nx: y\r\n\r\n"),
++            Some(b"abcde".to_vec())
++        );
++        assert_eq!(dechunk(b"0\r\n\r\n"), Some(Vec::new()));
++        assert_eq!(dechunk(b"5\r\nab"), None);
++    }
++
++    #[test]
++    fn preflight_headers_withhold_hop_by_hop_and_cookies() {
++        let headers = middleware_response_headers(
++            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nSet-Cookie: s=1\r\nConnection: keep-alive\r\nX-Request-Id: r1\r\n\r\n",
++        );
++        assert_eq!(
++            headers,
++            vec![
++                ("content-type".to_string(), "application/json".to_string()),
++                ("x-request-id".to_string(), "r1".to_string()),
++            ]
++        );
++    }
++}
+diff --git a/crates/openshell-supervisor-network/src/proxy.rs b/crates/openshell-supervisor-network/src/proxy.rs
+index 46c8f69..88fdb7c 100644
+--- a/crates/openshell-supervisor-network/src/proxy.rs
++++ b/crates/openshell-supervisor-network/src/proxy.rs
+@@ -4763,6 +4763,7 @@ where
+             signing_region: options.signing_region,
+             host: options.host,
+             port: options.port,
++            response_middleware: None,
+         },
+     )
+     .await

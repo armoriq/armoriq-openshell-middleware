@@ -62,7 +62,8 @@ sandbox receives it, so the plan is in place before the agent can act on it.
 
 **This needs a gateway that dispatches `HTTP_RESPONSE/PRE_RETURN`.** Stock OpenShell
 rejects that binding at registration and then refuses to start, so leave
-`-capture-plan` off unless the gateway dispatches the response path.
+`-capture-plan` off unless the gateway runs the patch in
+[patches/openshell](patches/openshell).
 
 Set `require_captured_plan: true` in a sandbox's middleware config to refuse tool calls
 made before any model reply has been seen. Without it, a sandbox is held to its plan
@@ -260,6 +261,7 @@ cmd/openshell-middleware   the binary
 pkg/openshell              the gRPC services and the decision logic
 pkg/iapclient              the ArmorIQ control plane client
 proto/openshell            OpenShell's middleware contract, vendored
+patches/openshell          the gateway patch that dispatches responses
 ```
 
 The `Verifier` interface in `pkg/openshell` is the extension point if you want to

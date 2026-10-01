@@ -49,7 +49,7 @@ func TestPolicyDeclaredIdentityIsWhatWeAskAbout(t *testing.T) {
 	req := mcpCall("github_create_issue")
 	req.Config = cfg(t, map[string]any{
 		ConfigAgentID:   "agent-from-policy",
-		ConfigUserEmail: "hari@armoriq.io",
+		ConfigUserEmail: "requester@example.com",
 	})
 
 	got, err := v.Verify(context.Background(), req)
@@ -59,7 +59,7 @@ func TestPolicyDeclaredIdentityIsWhatWeAskAbout(t *testing.T) {
 	if seen.AgentID != "agent-from-policy" {
 		t.Errorf("agent = %q, the policy's declaration must win over the flag", seen.AgentID)
 	}
-	if seen.UserEmail != "hari@armoriq.io" {
+	if seen.UserEmail != "requester@example.com" {
 		t.Errorf("user email = %q", seen.UserEmail)
 	}
 }
@@ -90,18 +90,18 @@ func TestTwoSandboxesGetTheirOwnAgent(t *testing.T) {
 func TestIdentityFallsBackFieldByField(t *testing.T) {
 	srv, seen := enforceSpy(t)
 	v, err := NewIntentVerifier(iapclient.New(srv.URL, "k", time.Second),
-		StaticIdentity{AgentID: "flag-agent", UserEmail: "flag@armoriq.io"}, DenyUnnamed, 0)
+		StaticIdentity{AgentID: "flag-agent", UserEmail: "flag@example.com"}, DenyUnnamed, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	req := mcpCall("github_create_issue")
-	req.Config = cfg(t, map[string]any{ConfigUserEmail: "policy@armoriq.io"})
+	req.Config = cfg(t, map[string]any{ConfigUserEmail: "policy@example.com"})
 
 	if _, err := v.Verify(context.Background(), req); err != nil {
 		t.Fatal(err)
 	}
-	if seen.AgentID != "flag-agent" || seen.UserEmail != "policy@armoriq.io" {
+	if seen.AgentID != "flag-agent" || seen.UserEmail != "policy@example.com" {
 		t.Errorf("agent=%q email=%q", seen.AgentID, seen.UserEmail)
 	}
 }

@@ -3,3 +3,4 @@
 /dist/
 .DS_Store
 /openshell-middleware-linux-amd64
+__pycache__/

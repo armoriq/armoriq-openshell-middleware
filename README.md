@@ -1,7 +1,7 @@
 # ArmorIQ middleware for NVIDIA OpenShell
 
 Tool-level enforcement for agents running in
-[OpenShell](https://github.com/NVIDIA/openshell) sandboxes, as a supervisor middleware.
+[OpenShell](https://github.com/NVIDIA/OpenShell) sandboxes, as a supervisor middleware.
 On OpenShell v0.1.0 and later, which pass HTTP responses to middleware, it also holds
 each sandbox to the plan its model issued, which is what intent enforcement needs. See
 [Holding a sandbox to its model's plan](#holding-a-sandbox-to-its-models-plan).
@@ -15,6 +15,10 @@ its framework, language and runtime are irrelevant. Enforcement happens at the
 connection OpenShell already owns, and the tool name is read off the wire, so any
 tool your MCP servers expose works whatever it is called. The examples below use
 placeholder tool names; substitute your own.
+
+**To see it working first**, [examples/intent-demo](examples/intent-demo) runs the whole
+thing on one Linux host with a stand-in model and a scripted agent: the same call refused
+when the model did not ask for it, and allowed when it did.
 
 ## What it does
 
@@ -120,6 +124,9 @@ ARMORIQ_API_KEY=<key> ./openshell-middleware \
   -timeout 2500ms
 ```
 
+Add `-capture-plan` to hold each sandbox to its model's plan, on OpenShell v0.1.0 or
+later.
+
 Start it **before** the gateway. OpenShell refuses to start when a registered
 middleware is unavailable.
 
@@ -132,7 +139,7 @@ In your gateway config, normally `~/.config/openshell/gateway.toml`:
 
 ```toml
 [openshell]
-version = 1
+version = 2
 
 [[openshell.supervisor.middleware]]
 name = "armoriq-intent"
@@ -141,6 +148,8 @@ allow_insecure_transport = true   # same host only; use TLS otherwise
 max_payload_bytes = 262144
 timeout = "3s"
 ```
+
+OpenShell v0.1.0 and later require `version = 2` and reject `version = 1`.
 
 **`grpc_endpoint` must be reachable from the gateway and from every sandbox
 supervisor.** Supervisors run inside the container, so `127.0.0.1` there is the
@@ -191,6 +200,8 @@ service.
 | `-iap-url` | empty | control plane base url. Empty runs a skeleton verifier that decides nothing |
 | `-unnamed` | `deny` | what to do with traffic that names no tool |
 | `-agent-id` | empty | fallback agent for sandboxes whose policy declares none |
+| `-user-email` | empty | requester passed to the control plane, optional |
+| `-audience` | empty | expected JWT audience; empty skips the consistency check |
 | `-timeout` | `450ms` | binding timeout to declare, between 10ms and 30s |
 | `-max-body` | `262144` | largest body accepted buffered |
 | `-audit` | `true` | record decisions the control plane does not see |
@@ -239,8 +250,9 @@ decision path and a full buffer drops rows rather than delaying a decision.
 
 ## Limits worth knowing before you rely on it
 
-- **It sees requests, not processes.** The evaluation carries no process identity,
-  so nothing can be conditioned on which process inside the sandbox made the call.
+- **It sees requests, not processes.** OpenShell leaves the request's originating
+  process unset today, so nothing can be conditioned on which process inside the
+  sandbox made the call, and a captured plan is held per sandbox.
 - **The declared tool set is written by whoever creates the sandbox**, not declared
   by the agent. It is a scope boundary for the sandbox rather than a per task
   declaration.

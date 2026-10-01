@@ -9,10 +9,10 @@
 //
 //	[[openshell.supervisor.middleware]]
 //	name = "armoriq-intent"
-//	grpc_endpoint = "http://127.0.0.1:50071"
+//	grpc_endpoint = "http://172.17.0.1:50071"
 //	allow_insecure_transport = true
 //	max_payload_bytes = 262144
-//	timeout = "500ms"
+//	timeout = "3s"
 package main
 
 import (
